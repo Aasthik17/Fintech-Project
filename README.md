@@ -1,5 +1,5 @@
 # Fintech-Project
-This is a repository for our AI-based personal finance management web application.
+This is a repository for our AI-based personal finance management mobile application.
 
 AI-Driven FinTech Application
 
