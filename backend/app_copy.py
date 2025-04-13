@@ -1,16 +1,13 @@
 import os
-from flask import Flask, request, jsonify
-from flask_sqlalchemy import SQLAlchemy
-from flask_cors import CORS
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
-import joblib
 import logging
 import datetime
 import pytz
 import requests
 import re
-from sqlalchemy import text
 from werkzeug.security import generate_password_hash, check_password_hash
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.auth.transport.requests import Request
@@ -18,29 +15,31 @@ from google.oauth2 import service_account
 from googleapiclient.errors import HttpError
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+import joblib
+from sqlalchemy import text
 
+# Initialize app and config
+app = Flask(__name__)
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+
+# Config for SQLite and JWT
+db_path = os.path.abspath("./final.db")
+app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_path}"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["JWT_SECRET_KEY"] = "super-secret-key"  
+jwt = JWTManager(app)
+
+# Initialize the database
+db = SQLAlchemy(app)
+
+# Set up rate limiting
 limiter = Limiter(
     get_remote_address,
     app=app,
     default_limits=["200 per day", "50 per hour"]
 )
-
-
-app = Flask(__name__)
-CORS(app)
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-
-# Correct Database Configuration
-db_path = os.path.abspath("./finance_manager.db")
-app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_path}"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["JWT_SECRET_KEY"] = "super-secret-key"  # Change this to a secure secret in production
-jwt = JWTManager(app)
-
-
-db = SQLAlchemy(app)
 
 # User Model
 class User(db.Model):
@@ -80,17 +79,19 @@ class Transaction(db.Model):
     transaction_date = db.Column(db.DateTime, default=datetime.datetime.utcnow)
     transaction_metadata = db.Column(db.Text, nullable=True)
 
-# Test Database Connection
-with app.app_context():
-    try:
-        db.session.execute(text('SELECT 1'))
-        print("✅ Database connection successful!")
-    except Exception as e:
-        print(f"❌ Database connection failed: {e}")
+# OCR Result Model
+class OcrResult(db.Model):
+    __tablename__ = 'ocr_results'
+    result_id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.user_id'), nullable=False)
+    ocr_output = db.Column(db.Text, nullable=False)
+    transaction_id = db.Column(db.Integer, db.ForeignKey('transactions.transaction_id'), nullable=True)
 
-# Ensure all tables exist before running the app
-with app.app_context():
-    db.create_all()
+# Google Drive API setup
+SERVICE_ACCOUNT_FILE = os.path.expanduser("~/Desktop/google-drive-key.json")
+SCOPES = ['https://www.googleapis.com/auth/drive']
+credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+drive_service = build('drive', 'v3', credentials=credentials)
 
 # Load ML Model
 model_path = "/Users/vanshoberoi/Desktop/model.pkl"
@@ -100,14 +101,19 @@ if model:
 else:
     logging.warning("ML Model not found. Ensure the necessary file exists.")
 
-# Google Drive API setup
-SERVICE_ACCOUNT_FILE = os.path.expanduser("~/Desktop/google-drive-key.json")
-SCOPES = ['https://www.googleapis.com/auth/drive']
-credentials = service_account.Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE, scopes=SCOPES
-)
-drive_service = build('drive', 'v3', credentials=credentials)
+# Ensure all tables exist before running the app
+with app.app_context():
+    db.create_all()
 
+# Test Database Connection
+with app.app_context():
+    try:
+        db.session.execute(text('SELECT 1'))
+        logging.info("✅ Database connection successful!")
+    except Exception as e:
+        logging.error(f"❌ Database connection failed: {e}")
+
+# Function to upload image to Google Drive and run OCR
 def upload_image_and_ocr(image_path=None):
     file_id = None  # Initialize file_id to handle edge case if upload fails
     try:
@@ -156,11 +162,44 @@ def upload_image_and_ocr(image_path=None):
             except OSError as e:
                 logging.error(f"Error deleting temporary file {image_path}: {str(e)}")
 
-    return ocr_result if image_path else None
+    if image_path:
+        date, amount, category = run_your_model(file_url)
+        return date, amount, category
+    else:
+        return None, None, None
+
+    
+        # Store the OCR result in the database
+        ocr_text_summary = f"Date: {date}, Amount: {amount}, Category: {category}"
+        new_result = OcrResult(user_id=current_user_id, ocr_output=ocr_text_summary)
+        db.session.add(new_result)
+        db.session.commit()
+
+        return jsonify({
+            "message": "OCR processed successfully.",
+            "data": {
+                "date": date,
+                "amount": amount,
+                "category": category
+            }
+        }), 200
+
+    except Exception as e:
+        logging.error(f"OCR route error: {str(e)}")
+        return jsonify({"error": "An error occurred during OCR processing."}), 500
 
 def run_your_model(file_url):
-    # This should be replaced with actual OCR logic
-               
+    if model:
+        result = model.predict([file_url])  # simulate call
+        result_dict = result[0]  # your output is a list of dicts
+        return (
+            result_dict.get("date", "Not found"),
+            result_dict.get("total_amount", "Not found"),
+            result_dict.get("category", "Not found")
+        )
+    else:
+        raise Exception("Model is not loaded properly.")
+
 # Function to get user's timezone from IP
 def get_user_timezone():
     try:
@@ -290,10 +329,10 @@ def add_expense():
 
         return jsonify({'message': 'Expense added successfully', 'transaction_id': new_transaction.transaction_id})
     except Exception as e:
-        logging.error(f"Error adding expense: {str(e)}")
+        db.session.rollback()
         return jsonify({'error': 'Failed to add expense'}), 500
 
-@app.route('/get_expenses', methods=['GET'])
+@app.route('/get_expenses',methods=['GET'])
 @jwt_required()
 
 def get_expenses():
