@@ -97,7 +97,7 @@ drive_service = build('drive', 'v3', credentials=credentials)
 model_path = "/Users/vanshoberoi/Desktop/model.pkl"
 model = joblib.load(model_path) if os.path.exists(model_path) else None
 if model:
-    logging.info("ML model loaded successfully.")
+    logging.info("✅ ML model loaded successfully.")
 else:
     logging.warning("ML Model not found. Ensure the necessary file exists.")
 
@@ -113,80 +113,58 @@ with app.app_context():
     except Exception as e:
         logging.error(f"❌ Database connection failed: {e}")
 
-# Function to upload image to Google Drive and run OCR
-def upload_image_and_ocr(image_path=None):
-    file_id = None  # Initialize file_id to handle edge case if upload fails
+def upload_image_and_ocr(image_path=None, current_user_id=None):
+    file_id = None
     try:
-        # If no image_path is provided, skip the process without any notification
         if image_path is None:
-            return None  # No image to process, simply move on
-        
+            return None, None, None
+
         # Step 1: Upload image to Google Drive
         file_metadata = {'name': os.path.basename(image_path)}
         media = MediaFileUpload(image_path, mimetype='image/jpeg')
         file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        file_id = file.get('id')  # Get file ID from the upload response
-        
-        # Step 2: Set permissions to make the file publicly accessible temporarily
+        file_id = file.get('id')
+
+        # Step 2: Set permissions to make the file publicly accessible
         drive_service.permissions().create(
             fileId=file_id,
             body={'type': 'anyone', 'role': 'reader'}
         ).execute()
-        
-        # Get the URL of the uploaded file for OCR
+
         file_url = f"https://drive.google.com/uc?id={file_id}"
 
-        # Step 3: Perform OCR (replace with your actual OCR logic)
-        ocr_result = run_your_model(file_url)
-        
+        # Step 3: Perform OCR
+        date, amount, category = run_your_model(file_url)
+
+        # Step 4: Store OCR result in the database
+        if current_user_id is not None:
+            ocr_text_summary = f"Date: {date}, Amount: {amount}, Category: {category}"
+            new_result = OcrResult(user_id=current_user_id, ocr_output=ocr_text_summary)
+            db.session.add(new_result)
+            db.session.commit()
+
+        return date, amount, category
+
     except HttpError as e:
         logging.error(f"Google Drive API error: {str(e)}")
         raise Exception("Error uploading image to Google Drive or during OCR.")
-    
+
     except Exception as e:
         logging.error(f"Unexpected error: {str(e)}")
         raise Exception("Unexpected error occurred during OCR processing.")
-    
+
     finally:
-        # Step 4: Clean up by deleting the image from Google Drive after processing
         if file_id:
             try:
                 drive_service.files().delete(fileId=file_id).execute()
             except HttpError as e:
                 logging.error(f"Error deleting file from Google Drive: {str(e)}")
-        
-        # Optionally, if the image was temporarily saved on the server, remove it
-        if image_path and os.path.exists(image_path):  # Check if the file exists
+
+        if image_path and os.path.exists(image_path):
             try:
                 os.remove(image_path)
             except OSError as e:
                 logging.error(f"Error deleting temporary file {image_path}: {str(e)}")
-
-    if image_path:
-        date, amount, category = run_your_model(file_url)
-        return date, amount, category
-    else:
-        return None, None, None
-
-    
-        # Store the OCR result in the database
-        ocr_text_summary = f"Date: {date}, Amount: {amount}, Category: {category}"
-        new_result = OcrResult(user_id=current_user_id, ocr_output=ocr_text_summary)
-        db.session.add(new_result)
-        db.session.commit()
-
-        return jsonify({
-            "message": "OCR processed successfully.",
-            "data": {
-                "date": date,
-                "amount": amount,
-                "category": category
-            }
-        }), 200
-
-    except Exception as e:
-        logging.error(f"OCR route error: {str(e)}")
-        return jsonify({"error": "An error occurred during OCR processing."}), 500
 
 def run_your_model(file_url):
     if model:
